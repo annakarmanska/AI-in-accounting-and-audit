@@ -1,0 +1,174 @@
+import os
+import unicodedata
+from datetime import date
+import xbrl_filings_api as xf
+import nest_asyncio
+
+# This line "fixes" Jupyter, allowing seamless asynchronous fetching.
+nest_asyncio.apply()
+
+# ==============================================================================
+# === FUNCTION TO SANITIZE FILENAMES ===
+# ==============================================================================
+
+def sanitize_filename(name: str) -> str:
+    """
+    Cleans a company name to make it safe for use as a filename.
+    1. Converts diacritics to their Latin equivalents (e.g., 'ü' -> 'u').
+    2. Removes illegal characters.
+    3. Replaces spaces with underscores.
+    4. Shortens the name to a safe length.
+    """
+    # Step 1: Normalize Unicode to convert special characters (like 'ő', 'ü', 'ę')
+    # to their basic Latin equivalents. This is a robust way to handle all languages.
+    try:
+        # This attempts to encode to ASCII, ignoring errors, which effectively removes diacritics.
+        name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode('ascii')
+    except Exception:
+        pass  # Ignore errors if normalization fails for any reason.
+
+    # Step 2: Convert to lowercase and remove characters that are illegal in filenames.
+    name = name.lower()
+    illegal_chars = '<>:"/\\|?*.'
+    for char in illegal_chars:
+        name = name.replace(char, '')
+        
+    # Step 3: Replace spaces and hyphens with underscores for better readability.
+    name = name.replace(' ', '_').replace('-', '_')
+    
+    # Remove any potential double underscores that result from the replacements.
+    while '__' in name:
+        name = name.replace('__', '_')
+        
+    # Step 4: Shorten the name if it's too long, as filesystems have limits.
+    return name[:100]
+
+# ==============================================================================
+# === USER INPUT & CONFIGURATION FUNCTIONS ===
+# ==============================================================================
+
+def get_year_input():
+    """Prompts the user for a valid target year."""
+    while True:
+        year_input = input("Enter the year for which to download the filings (e.g., 2023): ").strip()
+        try:
+            year = int(year_input)
+            if 2000 <= year <= date.today().year + 1:
+                return year
+            else:
+                print(f"Invalid year. Please enter a year between 2000 and {date.today().year + 1}.")
+        except ValueError:
+            print("Invalid input. Please enter a valid number for the year.")
+
+def get_country_input():
+    """Prompts the user for a two-letter EU country code."""
+    while True:
+        country = input("Enter the two-letter EU country code (e.g., PL, HU, FR): ").strip().upper()
+        if len(country) == 2 and country.isalpha():
+            return country
+        else:
+            print("Invalid country code. Please enter a two-letter alphabetical code (e.g., 'PL').")
+
+# --- Get user input ---
+TARGET_YEAR = get_year_input()
+TARGET_COUNTRY = get_country_input()
+
+# --- Set default parameters ---
+DOWNLOAD_FOLDER_NAME = "downloaded_filings"
+DOWNLOAD_DIR = f"{DOWNLOAD_FOLDER_NAME}_{TARGET_COUNTRY}_{TARGET_YEAR}"
+
+print("\n" + "="*70)
+print(f"📁 Target Directory: {DOWNLOAD_DIR}")
+print(f"🎯 Target Country: {TARGET_COUNTRY}")
+print(f"📅 Target Year: {TARGET_YEAR}")
+print("="*70)
+
+# Create the target directory if it doesn't already exist.
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# ==============================================================================
+# === MAIN SCRIPT LOGIC WITH CLEAN FILENAMES ===
+# ==============================================================================
+try:
+    print(f"\n🔎 Searching for all {TARGET_COUNTRY} filings for the year {TARGET_YEAR}...")
+
+    # Query the API to get a list of all filings for the specified country and year.
+    all_filings_api = xf.query.get_filings(
+        filters={
+            "country": TARGET_COUNTRY,
+            "last_end_date": [f"{TARGET_YEAR}-{m:02d}" for m in range(1, 13)]
+        },
+        sort="-added_time",
+        flags=xf.ScopeFlag.GET_ENTITY
+    )
+
+    if not all_filings_api:
+        print(f"🟡 No filings found for {TARGET_COUNTRY} for the year {TARGET_YEAR}.")
+    else:
+        all_filings_list = list(all_filings_api)
+        print(f"👍 Found {len(all_filings_list)} filings in the API. Checking which have already been downloaded...")
+
+        # Check which filings already exist using the new, sanitized naming convention.
+        filings_to_download = []
+        for filing in all_filings_list:
+            sanitized_name = sanitize_filename(filing.entity.name)
+            final_filename = f"{sanitized_name}_{filing.api_id}.zip"
+            if not os.path.exists(os.path.join(DOWNLOAD_DIR, final_filename)):
+                filings_to_download.append(filing)
+
+        print(f"   - Filings found in API: {len(all_filings_list)}")
+        print(f"   - Filings remaining to download: {len(filings_to_download)}")
+
+        if not filings_to_download:
+            print("\n✔️ All found filings are already downloaded. Exiting application.")
+            exit()
+
+        print(f"\n📥 Prepared to download {len(filings_to_download)} new filings one by one.")
+
+        downloaded_count = 0
+        for i, filing in enumerate(filings_to_download, 1):
+            print(f"\n--- Processing file {i}/{len(filings_to_download)} ---")
+            
+            # Create the final, clean destination filename.
+            sanitized_name = sanitize_filename(filing.entity.name)
+            final_filename = f"{sanitized_name}_{filing.api_id}.zip"
+            final_filepath = os.path.join(DOWNLOAD_DIR, final_filename)
+
+            try:
+                # Step 1: Take a "snapshot" of the directory's contents BEFORE downloading.
+                files_before = set(os.listdir(DOWNLOAD_DIR))
+
+                # Step 2: Download the single file. It will be saved with its complex, default name.
+                filing_set = xf.FilingSet([filing])
+                print(f"   -> Downloading: {filing.entity.name}")
+                filing_set.download(['package'], to_dir=DOWNLOAD_DIR)
+
+                # Step 3: Take a "snapshot" of the directory's contents AFTER downloading.
+                files_after = set(os.listdir(DOWNLOAD_DIR))
+
+                # Step 4: Find the newly created .zip file by comparing the before and after snapshots.
+                newly_created_files = files_after - files_before
+                newly_created_zip = None
+                for new_file in newly_created_files:
+                    if new_file.endswith('.zip'):
+                        newly_created_zip = new_file
+                        break
+                
+                if newly_created_zip:
+                    original_path = os.path.join(DOWNLOAD_DIR, newly_created_zip)
+                    
+                    # Step 5: Rename the original file to our new, clean, and readable filename.
+                    os.rename(original_path, final_filepath)
+                    print(f"   ✔️ Downloaded and saved as '{final_filename}'")
+                    downloaded_count += 1
+                else:
+                    print(f"   ⚠️ WARNING: Could not identify the newly downloaded .zip file. Skipping rename.")
+
+            except Exception as single_download_error:
+                print(f"   ❌ ERROR: Failed to download filing for {filing.entity.name}. Error: {single_download_error}")
+
+        print(f"\n🎉 Finished! Successfully saved {downloaded_count} new filings in folder: {DOWNLOAD_DIR}")
+
+except Exception as e:
+    print(f"\n❌ An unexpected error occurred: {e}")
+    print(f"Error type: {type(e).__name__}")
