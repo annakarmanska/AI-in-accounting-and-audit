@@ -1,0 +1,123 @@
+import os
+import unicodedata
+from datetime import date
+import xbrl_filings_api as xf
+import nest_asyncio
+
+# Ta linia "naprawia" Jupytera, pozwalając na płynne operacje asynchroniczne.
+nest_asyncio.apply()
+
+# ==============================================================================
+# === FUNKCJA DO "CZYSZCZENIA" NAZW PLIKÓW ===
+# ==============================================================================
+
+def sanitize_filename(name: str) -> str:
+    """
+    Czyści nazwę firmy, aby była bezpieczna jako nazwa pliku.
+    1. Zamienia znaki diakrytyczne na ich łacińskie odpowiedniki (np. 'ü' -> 'u').
+    2. Usuwa niedozwolone znaki.
+    3. Zamienia spacje na podkreślenia.
+    4. Skraca nazwę do bezpiecznej długości.
+    """
+    # Krok 1: Normalizacja Unicode w celu zamiany znaków specjalnych (jak 'ő', 'ü', 'ę')
+    # na ich podstawowe łacińskie odpowiedniki. To niezawodny sposób na obsługę wszystkich języków.
+    try:
+        # Ta operacja próbuje zakodować tekst do ASCII, ignorując błędy, co skutecznie usuwa znaki diakrytyczne.
+        name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode('ascii')
+    except Exception:
+        pass  # Ignoruj błędy, jeśli normalizacja z jakiegoś powodu zawiedzie.
+
+    # Krok 2: Zamiana na małe litery i usunięcie znaków niedozwolonych w nazwach plików.
+    name = name.lower()
+    illegal_chars = '<>:"/\\|?*.'
+    for char in illegal_chars:
+        name = name.replace(char, '')
+        
+    # Krok 3: Zamiana spacji i myślników na podkreślenia dla lepszej czytelności.
+    name = name.replace(' ', '_').replace('-', '_')
+    
+    # Usuń ewentualne podwójne podkreślenia, które mogły powstać w wyniku zamian.
+    while '__' in name:
+        name = name.replace('__', '_')
+        
+    # Krok 4: Skróć nazwę, jeśli jest zbyt długa, ponieważ systemy plików mają ograniczenia.
+    return name[:100]
+
+# ==============================================================================
+# === FUNKCJE POBIERAJĄCE DANE OD UŻYTKOWNIKA ===
+# ==============================================================================
+
+def get_year_input():
+    """Pyta użytkownika o prawidłowy rok docelowy."""
+    while True:
+        year_input = input("Wprowadź rok, dla którego chcesz pobrać sprawozdania (np. 2023): ").strip()
+        try:
+            year = int(year_input)
+            if 2000 <= year <= date.today().year + 1:
+                return year
+            else:
+                print(f"Nieprawidłowy rok. Wprowadź rok pomiędzy 2000 a {date.today().year + 1}.")
+        except ValueError:
+            print("Nieprawidłowa wartość. Wprowadź poprawną liczbę.")
+
+def get_country_input():
+    """Pyta użytkownika o dwuliterowy kod kraju UE."""
+    while True:
+        country = input("Wprowadź dwuliterowy kod kraju UE (np. PL, HU, FR): ").strip().upper()
+        if len(country) == 2 and country.isalpha():
+            return country
+        else:
+            print("Nieprawidłowy kod kraju. Wprowadź dwuliterowy kod (np. 'PL').")
+
+# --- Pobranie danych od użytkownika ---
+TARGET_YEAR = get_year_input()
+TARGET_COUNTRY = get_country_input()
+
+# --- Ustawienie parametrów domyślnych ---
+DOWNLOAD_FOLDER_NAME = "pobrane_sprawozdania"
+DOWNLOAD_DIR = f"{DOWNLOAD_FOLDER_NAME}_{TARGET_COUNTRY}_{TARGET_YEAR}"
+
+print("\n" + "="*70)
+print(f"📁 Folder docelowy: {DOWNLOAD_DIR}")
+print(f"🎯 Kraj : {TARGET_COUNTRY}")
+print(f"📅 Rok : {TARGET_YEAR}")
+print("="*70)
+
+# Utwórz folder docelowy, jeśli jeszcze nie istnieje.
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# ==============================================================================
+# === GŁÓWNA LOGIKA SKRYPTU Z CZYSTYMI NAZWAMI PLIKÓW ===
+# ==============================================================================
+try:
+    print(f"\n🔎 Wyszukiwanie wszystkich sprawozdań dla {TARGET_COUNTRY} z roku {TARGET_YEAR}...")
+
+    # Zapytanie do API o listę wszystkich sprawozdań dla danego kraju i roku.
+    all_filings_api = xf.query.get_filings(
+        filters={
+            "country": TARGET_COUNTRY,
+            "last_end_date": [f"{TARGET_YEAR}-{m:02d}" for m in range(1, 13)]
+        },
+        sort="-added_time",
+        flags=xf.ScopeFlag.GET_ENTITY
+    )
+
+    if not all_filings_api:
+        print(f"🟡 Nie znaleziono żadnych sprawozdań dla {TARGET_COUNTRY} w roku {TARGET_YEAR}.")
+    else:
+        all_filings_list = list(all_filings_api)
+        print(f"👍 Znaleziono {len(all_filings_list)} sprawozdań w API. Sprawdzanie, które już zostały pobrane...")
+
+        # Sprawdź, które sprawozdania już istnieją, używając nowej, bezpiecznej konwencji nazewnictwa.
+        filings_to_download = []
+        for filing in all_filings_list:
+            sanitized_name = sanitize_filename(filing.entity.name)
+            final_filename = f"{sanitized_name}_{filing.api_id}.zip"
+            if not os.path.exists(os.path.join(DOWNLOAD_DIR, final_filename)):
+                filings_to_download.append(filing)
+
+        print(f"   - Sprawozdań znalezionych w API: {len(all_filings_list)}")
+        print(f"   - Pozostało do pobrania: {len(filings_to_download)}")
+
+        if not filings_to_download:
+            print("\n✔️ Wszystkie znalezione sprawozdania są już pobrane. Aplikacja zako
